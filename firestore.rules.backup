@@ -1,0 +1,63 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function ok() { return request.auth != null && request.auth.token.email_verified == true; }
+    // active() = verified and not banned. Used for anything that writes.
+    function active() { return ok() && !exists(/databases/$(database)/documents/banned/$(request.auth.uid)); }
+    function isAdmin() { return ok() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)); }
+    function blockedPair(a, b) {
+      return exists(/databases/$(database)/documents/blocks/$(a + '_' + b))
+          || exists(/databases/$(database)/documents/blocks/$(b + '_' + a));
+    }
+    function conv(cid) { return get(/databases/$(database)/documents/conversations/$(cid)).data; }
+    function valid() {
+      let d = request.resource.data;
+      return d.keys().hasAll(['name','phone','teach','curProv','curTown','wantProv'])
+        && d.name is string && d.name.size() <= 80
+        && d.phone is string && d.phone.size() <= 20
+        && d.teach is string && d.teach.size() <= 150
+        && d.wantProv is list && d.wantProv.size() >= 1 && d.wantProv.size() <= 9
+        && (!('about' in d) || d.about.size() <= 400);
+    }
+    match /teachers/{id} {
+      allow read: if ok();
+      allow create, update: if active() && request.auth.uid == id && valid();
+      allow delete: if ok() && (request.auth.uid == id || isAdmin());
+    }
+    match /conversations/{cid} {
+      allow read: if ok() && (resource == null || request.auth.uid in resource.data.members);
+      allow create: if active() && request.auth.uid in request.resource.data.members
+        && request.resource.data.members.size() == 2
+        && cid == request.resource.data.members[0] + '_' + request.resource.data.members[1]
+        && !blockedPair(request.resource.data.members[0], request.resource.data.members[1])
+        && request.resource.data.lastMsg.size() <= 120;
+      allow update: if active() && request.auth.uid in resource.data.members
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMsg','lastAt','lastFrom','readAt'])
+        && request.resource.data.lastMsg.size() <= 120;
+      match /messages/{mid} {
+        allow read: if ok() && request.auth.uid in conv(cid).members;
+        allow create: if active() && request.auth.uid in conv(cid).members
+          && !blockedPair(conv(cid).members[0], conv(cid).members[1])
+          && request.resource.data.from == request.auth.uid
+          && request.resource.data.text is string && request.resource.data.text.size() > 0 && request.resource.data.text.size() <= 1000;
+      }
+    }
+    // A user's block list. Only the blocker can read it, so the blocked person never finds out.
+    match /blocks/{id} {
+      allow read: if ok() && resource.data.by == request.auth.uid;
+      allow create: if active() && request.resource.data.by == request.auth.uid && id == request.auth.uid + '_' + request.resource.data.target;
+      allow delete: if ok() && resource.data.by == request.auth.uid;
+    }
+    match /reports/{id} {
+      allow create: if active() && request.resource.data.by == request.auth.uid && id.matches(request.auth.uid + '_.*')
+        && (!('excerpt' in request.resource.data) || request.resource.data.excerpt.size() <= 30);
+      allow read, delete: if isAdmin();
+    }
+    match /banned/{id} {
+      allow read, write: if isAdmin();
+    }
+    match /admins/{id} {
+      allow read: if ok() && request.auth.uid == id;
+    }
+  }
+}
